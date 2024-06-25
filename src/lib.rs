@@ -41,6 +41,7 @@ impl Database {
             return Ok(None);
         };
 
+        let restore = self.log.stream_position()?;
         self.log.seek(SeekFrom::Start(*offset))?;
 
         // skip the key_len and key
@@ -56,6 +57,9 @@ impl Database {
         let mut buf = vec![0; value_len];
         self.log.read_exact(&mut buf)?;
         let value = String::from_utf8(buf)?;
+
+        self.log.seek(SeekFrom::Start(restore))?;
+
         Ok(Some(value))
     }
 }
@@ -67,9 +71,17 @@ mod tests {
     #[test]
     fn read_write() {
         let mut database = Database::new().unwrap();
-        database.set("hello", "world").unwrap();
-        database.set("goodbye", "world").unwrap();
-        let value = database.get("goodbye").unwrap();
-        assert_eq!(value, Some("world".into()))
+
+        database.set("hello", "sun").unwrap();
+        database.set("goodbye", "moon").unwrap();
+        database.set("farewell", "sky").unwrap();
+
+        let hello = database.get("hello").unwrap();
+        let goodbye = database.get("goodbye").unwrap();
+        let farewell = database.get("farewell").unwrap();
+
+        assert_eq!(hello, Some("sun".into()));
+        assert_eq!(goodbye, Some("moon".into()));
+        assert_eq!(farewell, Some("sky".into()));
     }
 }
