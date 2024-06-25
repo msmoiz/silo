@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
 };
 
 pub struct Database {
@@ -10,8 +10,8 @@ pub struct Database {
 }
 
 impl Database {
-    /// Creates a new Database instance.
-    pub fn new() -> anyhow::Result<Self> {
+    /// Starts a Database server.
+    pub fn start() -> anyhow::Result<Self> {
         fs::remove_file("database.log").ok();
 
         let log = fs::OpenOptions::new()
@@ -24,6 +24,39 @@ impl Database {
             index: HashMap::new(),
             log,
         })
+    }
+
+    /// Starts an interactive session with a Database.
+    pub fn repl() -> anyhow::Result<()> {
+        let mut database = Self::start()?;
+        loop {
+            let mut line = String::new();
+            io::stdin().read_line(&mut line)?;
+            line.pop(); // strip newline
+
+            if line == "exit" {
+                println!("-> exiting");
+                break;
+            }
+
+            match line.split_once(' ') {
+                None => println!("-> err: unsupported command"),
+                Some(("get", key)) => match database.get(key)? {
+                    Some(value) => println!("-> {value}"),
+                    None => println!("-> null"),
+                },
+                Some(("set", key_value)) => match key_value.split_once(' ') {
+                    Some((key, value)) => {
+                        database.set(key, value)?;
+                        println!("-> set {key}")
+                    }
+                    None => println!("-> err: missing value"),
+                },
+                _ => println!("-> err: unsupported command"),
+            }
+        }
+
+        Ok(())
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
@@ -70,7 +103,7 @@ mod tests {
 
     #[test]
     fn read_write() {
-        let mut database = Database::new().unwrap();
+        let mut database = Database::start().unwrap();
 
         database.set("hello", "sun").unwrap();
         database.set("goodbye", "moon").unwrap();
