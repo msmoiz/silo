@@ -1,39 +1,62 @@
 use std::{
-    fs,
-    io::{BufRead, BufReader, Write},
+    collections::HashMap,
+    fs::{self, File},
+    io::{Read, Seek, SeekFrom, Write},
 };
 
-pub struct Database;
+pub struct Database {
+    index: HashMap<String, u64>,
+    log: File,
+}
 
 impl Database {
-    pub fn set(key: &str, value: &str) {
-        let mut log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("database.log")
-            .unwrap();
+    /// Creates a new Database instance.
+    pub fn new() -> anyhow::Result<Self> {
+        fs::remove_file("database.log").ok();
 
-        log.write(format!("{key}|{value}\n").as_bytes()).unwrap();
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open("database.log")?;
+
+        Ok(Self {
+            index: HashMap::new(),
+            log,
+        })
     }
 
-    pub fn get(key: &str) -> Option<String> {
-        let log = fs::OpenOptions::new()
-            .read(true)
-            .open("database.log")
-            .unwrap();
+    pub fn set(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
+        let offset = self.log.stream_position()?;
+        self.index.insert(key.to_owned(), offset);
+        self.log.write(&key.len().to_be_bytes())?;
+        self.log.write(key.as_bytes())?;
+        self.log.write(&value.len().to_be_bytes())?;
+        self.log.write(value.as_bytes())?;
+        Ok(())
+    }
 
-        let log = BufReader::new(log);
-        let mut lines = log.lines();
+    pub fn get(&mut self, key: &str) -> anyhow::Result<Option<String>> {
+        let Some(offset) = self.index.get(key) else {
+            return Ok(None);
+        };
 
-        let mut value = None;
-        while let Some(Ok(line)) = lines.next() {
-            let mut parts = line.split("|");
-            if parts.next() == Some(key) {
-                value = Some(parts.next().unwrap().to_owned());
-            }
-        }
+        self.log.seek(SeekFrom::Start(*offset))?;
 
-        value
+        // skip the key_len and key
+        let mut buf = [0; 8];
+        self.log.read_exact(&mut buf)?;
+        let key_len = usize::from_be_bytes(buf);
+        self.log.seek(SeekFrom::Current(key_len.try_into()?))?;
+
+        // read the value
+        let mut buf = [0; 8];
+        self.log.read_exact(&mut buf)?;
+        let value_len = usize::from_be_bytes(buf);
+        let mut buf = vec![0; value_len];
+        self.log.read_exact(&mut buf)?;
+        let value = String::from_utf8(buf)?;
+        Ok(Some(value))
     }
 }
 
@@ -43,8 +66,10 @@ mod tests {
 
     #[test]
     fn read_write() {
-        Database::set("hello", "world");
-        let value = Database::get("hello");
+        let mut database = Database::new().unwrap();
+        database.set("hello", "world").unwrap();
+        database.set("goodbye", "world").unwrap();
+        let value = database.get("goodbye").unwrap();
         assert_eq!(value, Some("world".into()))
     }
 }
