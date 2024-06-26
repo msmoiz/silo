@@ -4,6 +4,8 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
 };
 
+use anyhow::bail;
+
 pub struct Database {
     index: HashMap<String, u64>,
     log: File,
@@ -12,7 +14,28 @@ pub struct Database {
 impl Database {
     /// Starts a Database server.
     pub fn start() -> anyhow::Result<Self> {
-        fs::remove_file("database.log").ok();
+        let log = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open("database.log")?;
+
+        let mut index = HashMap::new();
+
+        for entry_res in LogReader::new(log) {
+            let Ok(entry) = entry_res else {
+                bail!("failed to parse database log");
+            };
+
+            match entry.operation {
+                Operation::Set(value) => {
+                    index.insert(entry.key.clone(), entry.offset);
+                }
+                Operation::Delete => {
+                    index.remove(&entry.key);
+                }
+            }
+        }
 
         let log = fs::OpenOptions::new()
             .create(true)
@@ -20,10 +43,7 @@ impl Database {
             .append(true)
             .open("database.log")?;
 
-        Ok(Self {
-            index: HashMap::new(),
-            log,
-        })
+        Ok(Self { index, log })
     }
 
     /// Starts an interactive session with a Database.
@@ -115,6 +135,73 @@ impl Database {
         self.log.write(key.as_bytes())?;
         self.log.write(&[1])?; // tombstone
         Ok(())
+    }
+}
+
+/// The operation recorded by a log entry.
+enum Operation {
+    Set(String),
+    Delete,
+}
+
+/// An entry in a log file.
+struct Entry {
+    offset: u64,
+    key: String,
+    operation: Operation,
+}
+
+/// Iterator over entries in a log file.
+struct LogReader {
+    f: File,
+}
+
+impl LogReader {
+    /// Creates a new reader from a file.
+    fn new(f: File) -> Self {
+        Self { f }
+    }
+}
+
+impl Iterator for LogReader {
+    type Item = anyhow::Result<Entry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let offset = self.f.stream_position().ok()?;
+
+        let mut buf = [0; 8];
+        self.f.read_exact(&mut buf).ok()?;
+        let key_len = usize::from_be_bytes(buf);
+
+        let mut buf = vec![0; key_len];
+        self.f.read_exact(&mut buf).ok()?;
+        let key = String::from_utf8(buf).ok()?;
+
+        let mut buf = [0; 1];
+        self.f.read_exact(&mut buf).ok()?;
+        let opcode = buf[0];
+
+        let operation = match opcode {
+            0 => {
+                let mut buf = [0; 8];
+                self.f.read_exact(&mut buf).ok()?;
+                let value_len = usize::from_be_bytes(buf);
+
+                let mut buf = vec![0; value_len];
+                self.f.read_exact(&mut buf).ok()?;
+                let value = String::from_utf8(buf).ok()?;
+
+                Operation::Set(value)
+            }
+            1 => Operation::Delete,
+            _ => panic!("unrecognized opcode: {opcode}"),
+        };
+
+        Some(Ok(Entry {
+            offset,
+            key,
+            operation,
+        }))
     }
 }
 
