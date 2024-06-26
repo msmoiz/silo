@@ -52,6 +52,10 @@ impl Database {
                     }
                     None => println!("-> err: missing value"),
                 },
+                Some(("del", key)) => {
+                    database.delete(key)?;
+                    println!("-> deleted {key}");
+                }
                 _ => println!("-> err: unsupported command"),
             }
         }
@@ -59,16 +63,19 @@ impl Database {
         Ok(())
     }
 
+    /// Sets the value for a key.
     pub fn set(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
         let offset = self.log.stream_position()?;
         self.index.insert(key.to_owned(), offset);
         self.log.write(&key.len().to_be_bytes())?;
         self.log.write(key.as_bytes())?;
+        self.log.write(&[0])?; // value
         self.log.write(&value.len().to_be_bytes())?;
         self.log.write(value.as_bytes())?;
         Ok(())
     }
 
+    /// Gets the value for a key.
     pub fn get(&mut self, key: &str) -> anyhow::Result<Option<String>> {
         let Some(offset) = self.index.get(key) else {
             return Ok(None);
@@ -83,6 +90,9 @@ impl Database {
         let key_len = usize::from_be_bytes(buf);
         self.log.seek(SeekFrom::Current(key_len.try_into()?))?;
 
+        // skip the type, expected to be value
+        self.log.seek(SeekFrom::Current(1))?;
+
         // read the value
         let mut buf = [0; 8];
         self.log.read_exact(&mut buf)?;
@@ -94,6 +104,17 @@ impl Database {
         self.log.seek(SeekFrom::Start(restore))?;
 
         Ok(Some(value))
+    }
+
+    /// Deletes the value for a key.
+    ///
+    /// This operation is idempotent and may be repeated multiple times.
+    pub fn delete(&mut self, key: &str) -> anyhow::Result<()> {
+        self.index.remove(key);
+        self.log.write(&key.len().to_be_bytes())?;
+        self.log.write(key.as_bytes())?;
+        self.log.write(&[1])?; // tombstone
+        Ok(())
     }
 }
 
@@ -116,5 +137,17 @@ mod tests {
         assert_eq!(hello, Some("sun".into()));
         assert_eq!(goodbye, Some("moon".into()));
         assert_eq!(farewell, Some("sky".into()));
+    }
+
+    #[test]
+    fn delete() {
+        let mut database = Database::start().unwrap();
+
+        database.set("hello", "world").unwrap();
+        database.delete("hello").unwrap();
+
+        let hello = database.get("hello").unwrap();
+
+        assert_eq!(hello, None);
     }
 }
