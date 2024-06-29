@@ -8,7 +8,7 @@ use anyhow::bail;
 
 pub struct Database {
     index: HashMap<String, u64>,
-    log: File,
+    log: Log,
 }
 
 impl Database {
@@ -20,15 +20,17 @@ impl Database {
             .append(true)
             .open("database.log")?;
 
+        let mut log = Log::new(log);
+
         let mut index = HashMap::new();
 
-        for entry_res in LogReader::new(log) {
-            let Ok(entry) = entry_res else {
+        for entry in log.entries() {
+            let Ok(entry) = entry else {
                 bail!("failed to parse database log");
             };
 
             match entry.operation {
-                Operation::Set(value) => {
+                Operation::Set(_) => {
                     index.insert(entry.key.clone(), entry.offset);
                 }
                 Operation::Delete => {
@@ -36,12 +38,6 @@ impl Database {
                 }
             }
         }
-
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open("database.log")?;
 
         Ok(Self { index, log })
     }
@@ -85,13 +81,8 @@ impl Database {
 
     /// Sets the value for a key.
     pub fn set(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
-        let offset = self.log.stream_position()?;
+        let offset = self.log.append(key, Operation::Set(value.to_owned()))?;
         self.index.insert(key.to_owned(), offset);
-        self.log.write(&key.len().to_be_bytes())?;
-        self.log.write(key.as_bytes())?;
-        self.log.write(&[0])?; // value
-        self.log.write(&value.len().to_be_bytes())?;
-        self.log.write(value.as_bytes())?;
         Ok(())
     }
 
@@ -101,27 +92,9 @@ impl Database {
             return Ok(None);
         };
 
-        let restore = self.log.stream_position()?;
-        self.log.seek(SeekFrom::Start(*offset))?;
-
-        // skip the key_len and key
-        let mut buf = [0; 8];
-        self.log.read_exact(&mut buf)?;
-        let key_len = usize::from_be_bytes(buf);
-        self.log.seek(SeekFrom::Current(key_len.try_into()?))?;
-
-        // skip the type, expected to be value
-        self.log.seek(SeekFrom::Current(1))?;
-
-        // read the value
-        let mut buf = [0; 8];
-        self.log.read_exact(&mut buf)?;
-        let value_len = usize::from_be_bytes(buf);
-        let mut buf = vec![0; value_len];
-        self.log.read_exact(&mut buf)?;
-        let value = String::from_utf8(buf)?;
-
-        self.log.seek(SeekFrom::Start(restore))?;
+        let Operation::Set(value) = self.log.entry_at(*offset)?.operation else {
+            bail!("indexed key offset does not point to value");
+        };
 
         Ok(Some(value))
     }
@@ -131,9 +104,7 @@ impl Database {
     /// This operation is idempotent and may be repeated multiple times.
     pub fn delete(&mut self, key: &str) -> anyhow::Result<()> {
         self.index.remove(key);
-        self.log.write(&key.len().to_be_bytes())?;
-        self.log.write(key.as_bytes())?;
-        self.log.write(&[1])?; // tombstone
+        self.log.append(key, Operation::Delete)?;
         Ok(())
     }
 }
@@ -151,45 +122,44 @@ struct Entry {
     operation: Operation,
 }
 
-/// Iterator over entries in a log file.
-struct LogReader {
-    f: File,
+/// A database log file.
+///
+/// Represents the official record of database contents.
+struct Log {
+    inner: File,
 }
 
-impl LogReader {
-    /// Creates a new reader from a file.
-    fn new(f: File) -> Self {
-        Self { f }
+impl Log {
+    /// Creates a new Log from an existing file.
+    fn new(inner: File) -> Self {
+        Self { inner }
     }
-}
 
-impl Iterator for LogReader {
-    type Item = anyhow::Result<Entry>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let offset = self.f.stream_position().ok()?;
+    /// Returns the entry that begins at the provided offset.
+    fn entry_at(&mut self, offset: u64) -> anyhow::Result<Entry> {
+        self.inner.seek(SeekFrom::Start(offset))?;
 
         let mut buf = [0; 8];
-        self.f.read_exact(&mut buf).ok()?;
+        self.inner.read_exact(&mut buf)?;
         let key_len = usize::from_be_bytes(buf);
 
         let mut buf = vec![0; key_len];
-        self.f.read_exact(&mut buf).ok()?;
-        let key = String::from_utf8(buf).ok()?;
+        self.inner.read_exact(&mut buf)?;
+        let key = String::from_utf8(buf)?;
 
         let mut buf = [0; 1];
-        self.f.read_exact(&mut buf).ok()?;
+        self.inner.read_exact(&mut buf)?;
         let opcode = buf[0];
 
         let operation = match opcode {
             0 => {
                 let mut buf = [0; 8];
-                self.f.read_exact(&mut buf).ok()?;
+                self.inner.read_exact(&mut buf)?;
                 let value_len = usize::from_be_bytes(buf);
 
                 let mut buf = vec![0; value_len];
-                self.f.read_exact(&mut buf).ok()?;
-                let value = String::from_utf8(buf).ok()?;
+                self.inner.read_exact(&mut buf)?;
+                let value = String::from_utf8(buf)?;
 
                 Operation::Set(value)
             }
@@ -197,11 +167,62 @@ impl Iterator for LogReader {
             _ => panic!("unrecognized opcode: {opcode}"),
         };
 
-        Some(Ok(Entry {
+        Ok(Entry {
             offset,
             key,
             operation,
-        }))
+        })
+    }
+
+    /// Appends a new entry to the end of the log.
+    ///
+    /// Returns the offset of the entry in the log.
+    fn append(&mut self, key: &str, operation: Operation) -> anyhow::Result<u64> {
+        self.inner.seek(SeekFrom::End(0))?;
+        let offset = self.inner.stream_position()?;
+
+        self.inner.write(&key.len().to_be_bytes())?;
+        self.inner.write(key.as_bytes())?;
+        match operation {
+            Operation::Set(value) => {
+                self.inner.write(&[0])?;
+                self.inner.write(&value.len().to_be_bytes())?;
+                self.inner.write(value.as_bytes())?;
+            }
+            Operation::Delete => {
+                self.inner.write(&[1])?;
+            }
+        }
+
+        Ok(offset)
+    }
+
+    /// Returns an iterator over entries in the log.
+    fn entries(&mut self) -> Entries {
+        Entries::new(self)
+    }
+}
+
+/// Iterator over entries in a log file.
+struct Entries<'a> {
+    log: &'a mut Log,
+    pos: u64,
+}
+
+impl<'a> Entries<'a> {
+    /// Creates a new iterator from a log.
+    fn new(log: &'a mut Log) -> Self {
+        Self { log, pos: 0 }
+    }
+}
+
+impl<'log> Iterator for Entries<'log> {
+    type Item = anyhow::Result<Entry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let entry = self.log.entry_at(self.pos).ok()?;
+        self.pos = self.log.inner.stream_position().ok()?;
+        Some(Ok(entry))
     }
 }
 
