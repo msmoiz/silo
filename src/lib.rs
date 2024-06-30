@@ -2,44 +2,69 @@ use std::{
     collections::HashMap,
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
+    os::unix::fs::MetadataExt,
 };
 
 use anyhow::bail;
+use ulid::Ulid;
+
+const SILO_DIR: &'static str = "silo";
+
+enum IndexEntry {
+    Offset(u64),
+    Tombstone,
+}
 
 pub struct Database {
-    index: HashMap<String, u64>,
-    log: Log,
+    logs: Vec<Log>,
+    indices: Vec<HashMap<String, IndexEntry>>,
 }
 
 impl Database {
     /// Starts a Database server.
     pub fn start() -> anyhow::Result<Self> {
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open("database.log")?;
+        fs::create_dir(SILO_DIR).ok();
 
-        let mut log = Log::new(log);
+        let mut logs = vec![]; // implicitly sorted chronologically
+        let mut indices = vec![];
 
-        let mut index = HashMap::new();
+        for dir_entry in fs::read_dir(SILO_DIR)? {
+            let path = dir_entry?.path();
 
-        for entry in log.entries() {
-            let Ok(entry) = entry else {
-                bail!("failed to parse database log");
-            };
+            let log = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(path)?;
 
-            match entry.operation {
-                Operation::Set(_) => {
-                    index.insert(entry.key.clone(), entry.offset);
-                }
-                Operation::Delete => {
-                    index.remove(&entry.key);
+            let mut log = Log::from_file(log);
+
+            let mut index = HashMap::new();
+            for entry in log.entries() {
+                let Ok(entry) = entry else {
+                    bail!("failed to parse database log");
+                };
+
+                match entry.operation {
+                    Operation::Set(_) => {
+                        index.insert(entry.key.clone(), IndexEntry::Offset(entry.offset));
+                    }
+                    Operation::Delete => {
+                        index.insert(entry.key.clone(), IndexEntry::Tombstone);
+                    }
                 }
             }
+
+            logs.push(log);
+            indices.push(index);
         }
 
-        Ok(Self { index, log })
+        if logs.is_empty() {
+            logs.push(Log::new()?);
+            indices.push(HashMap::new());
+        }
+
+        Ok(Self { logs, indices })
     }
 
     /// Starts an interactive session with a Database.
@@ -81,31 +106,60 @@ impl Database {
 
     /// Sets the value for a key.
     pub fn set(&mut self, key: &str, value: &str) -> anyhow::Result<()> {
-        let offset = self.log.append(key, Operation::Set(value.to_owned()))?;
-        self.index.insert(key.to_owned(), offset);
+        let offset = self
+            .log_tail()
+            .append(key, Operation::Set(value.to_owned()))?;
+
+        self.index_tail()
+            .insert(key.to_owned(), IndexEntry::Offset(offset));
+
+        const MAX_FILE_SIZE_BYTES: u64 = 4 * (1024u64.pow(3)); // 4MB
+        if self.log_tail().size()? >= MAX_FILE_SIZE_BYTES {
+            self.logs.push(Log::new()?);
+        }
+
         Ok(())
     }
 
     /// Gets the value for a key.
     pub fn get(&mut self, key: &str) -> anyhow::Result<Option<String>> {
-        let Some(offset) = self.index.get(key) else {
-            return Ok(None);
-        };
+        for (i, index) in self.indices.iter().rev().enumerate() {
+            let Some(index_entry) = index.get(key) else {
+                continue;
+            };
 
-        let Operation::Set(value) = self.log.entry_at(*offset)?.operation else {
-            bail!("indexed key offset does not point to value");
-        };
+            let IndexEntry::Offset(offset) = index_entry else {
+                return Ok(None);
+            };
 
-        Ok(Some(value))
+            let log_idx = self.logs.len() - i - 1;
+            let Operation::Set(value) = self.logs[log_idx].entry_at(*offset)?.operation else {
+                bail!("indexed key offset does not point to value");
+            };
+
+            return Ok(Some(value));
+        }
+
+        Ok(None)
     }
 
     /// Deletes the value for a key.
     ///
     /// This operation is idempotent and may be repeated multiple times.
     pub fn delete(&mut self, key: &str) -> anyhow::Result<()> {
-        self.index.remove(key);
-        self.log.append(key, Operation::Delete)?;
+        self.index_tail().remove(key);
+        self.log_tail().append(key, Operation::Delete)?;
         Ok(())
+    }
+
+    /// Returns a reference to the last log file.
+    fn log_tail(&mut self) -> &mut Log {
+        self.logs.last_mut().unwrap()
+    }
+
+    /// Returns a reference to the last index.
+    fn index_tail(&mut self) -> &mut HashMap<String, IndexEntry> {
+        self.indices.last_mut().unwrap()
     }
 }
 
@@ -130,8 +184,25 @@ struct Log {
 }
 
 impl Log {
-    /// Creates a new Log from an existing file.
-    fn new(inner: File) -> Self {
+    /// Creates a new Log.
+    ///
+    /// This creates a new log file on disk as well.
+    fn new() -> anyhow::Result<Self> {
+        let id = Ulid::new();
+
+        let name = format!("{SILO_DIR}/{id}.log",);
+
+        let inner = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(name)?;
+
+        Ok(Self { inner })
+    }
+
+    /// Creates a Log from an existing file.
+    fn from_file(inner: File) -> Self {
         Self { inner }
     }
 
@@ -200,6 +271,12 @@ impl Log {
     /// Returns an iterator over entries in the log.
     fn entries(&mut self) -> Entries {
         Entries::new(self)
+    }
+
+    /// Returns the current size of the log in bytes.
+    fn size(&self) -> anyhow::Result<u64> {
+        let size = self.inner.metadata()?.size();
+        Ok(size)
     }
 }
 
