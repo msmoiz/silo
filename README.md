@@ -24,6 +24,6 @@ You can also run an interactive session on the command line:
 > silo
 > set hello world
 -> set hello
-get hello
+> get hello
 -> world
 ```
