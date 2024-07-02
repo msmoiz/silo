@@ -6,10 +6,11 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::bail;
+use crc::CRC_16_IBM_SDLC;
 use ulid::Ulid;
 
 const SILO_DIR: &'static str = "silo";
@@ -302,6 +303,14 @@ impl Log {
     fn entry_at(&mut self, offset: u64) -> anyhow::Result<Entry> {
         self.inner.seek(SeekFrom::Start(offset))?;
 
+        let mut buf = [0; 2];
+        self.inner.read_exact(&mut buf)?;
+        let expected_checksum = u16::from_be_bytes(buf);
+
+        let mut buf = [0; 8];
+        self.inner.read_exact(&mut buf)?;
+        let timestamp = u64::from_be_bytes(buf);
+
         let mut buf = [0; 8];
         self.inner.read_exact(&mut buf)?;
         let key_len = usize::from_be_bytes(buf);
@@ -330,6 +339,29 @@ impl Log {
             _ => panic!("unrecognized opcode: {opcode}"),
         };
 
+        let actual_checksum = {
+            let crc = crc::Crc::<u16>::new(&CRC_16_IBM_SDLC);
+            let mut digest = crc.digest();
+            digest.update(&timestamp.to_be_bytes());
+            digest.update(&key.len().to_be_bytes());
+            digest.update(&key.as_bytes());
+            match &operation {
+                Operation::Set(value) => {
+                    digest.update(&[0]);
+                    digest.update(&value.len().to_be_bytes());
+                    digest.update(value.as_bytes());
+                }
+                Operation::Delete => {
+                    digest.update(&[1]);
+                }
+            }
+            digest.finalize()
+        };
+
+        if actual_checksum != expected_checksum {
+            bail!("checksums do not match for entry at position {offset}")
+        }
+
         Ok(Entry {
             offset,
             key,
@@ -344,6 +376,32 @@ impl Log {
         self.inner.seek(SeekFrom::End(0))?;
         let offset = self.inner.stream_position()?;
 
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let checksum = {
+            let crc = crc::Crc::<u16>::new(&CRC_16_IBM_SDLC);
+            let mut digest = crc.digest();
+            digest.update(&timestamp.to_be_bytes());
+            digest.update(&key.len().to_be_bytes());
+            digest.update(&key.as_bytes());
+            match &operation {
+                Operation::Set(value) => {
+                    digest.update(&[0]);
+                    digest.update(&value.len().to_be_bytes());
+                    digest.update(value.as_bytes());
+                }
+                Operation::Delete => {
+                    digest.update(&[1]);
+                }
+            }
+            digest.finalize()
+        };
+
+        self.inner.write(&checksum.to_be_bytes())?;
+        self.inner.write(&timestamp.to_be_bytes())?;
         self.inner.write(&key.len().to_be_bytes())?;
         self.inner.write(key.as_bytes())?;
         match operation {
